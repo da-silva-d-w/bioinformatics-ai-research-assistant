@@ -1,0 +1,5 @@
+streamlit
+pandas
+groq
+sentence-transformers
+torch
