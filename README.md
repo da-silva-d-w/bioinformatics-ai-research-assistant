@@ -1,4 +1,4 @@
-# Bioinformatics AI Research Assistant
+# Bioinformatics AI Research Assistant - https://bioinformatics-ai-research-assistant.streamlit.app/
 
 A Streamlit prototype for exploring scientific literature on artificial intelligence, machine learning, bioinformatics, and drug discovery.
 
