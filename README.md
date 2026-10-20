@@ -1,4 +1,4 @@
-# Bioinformatics AI Research Assistant
+# Scientific Literature Research Assistant
 
 **Live demo:** https://bioinformatics-ai-research-assistant.streamlit.app/
 
