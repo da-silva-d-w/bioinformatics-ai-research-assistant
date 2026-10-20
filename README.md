@@ -1,6 +1,6 @@
 # Scientific Literature Research Assistant
 
-**Live demo:** [https://bioinformatics-ai-research-assistant.streamlit.app/](https://scientific-literature-research-assistant.streamlit.app/)
+**Live demo:** https://scientific-literature-research-assistant.streamlit.app/
 
 A Streamlit application for exploring scientific literature on artificial intelligence, machine learning, bioinformatics, and drug discovery. It combines semantic search and relevance ranking with LLM-based answer generation to help users discover and investigate potentially relevant scientific papers.
 
