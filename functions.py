@@ -2,7 +2,130 @@ import pandas as pd
 import numpy as np
 import re
 import unicodedata
+import requests
+import xml.etree.ElementTree as ET
 
+
+def search_pubmed(query, existing_pmids=None, retmax=50):
+    """Busca artigos no PubMed e retorna artigos novos com metadados."""
+
+    if not query or not query.strip():
+        raise ValueError("Enter a PubMed search query.")
+
+    existing_pmids = {
+        str(pmid).strip()
+        for pmid in (existing_pmids or [])
+    }
+
+    base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+
+    response = requests.get(
+        base_url + "esearch.fcgi",
+        params={
+            "db": "pubmed",
+            "term": query.strip(),
+            "retmax": min(max(retmax * 3, retmax), 300),
+            "retmode": "json",
+            "sort": "relevance",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    pmids = response.json()["esearchresult"]["idlist"]
+
+    columns = [
+        "pmid", "title", "abstract", "url", "text",
+        "authors", "year"
+    ]
+
+    if not pmids:
+        return pd.DataFrame(columns=columns)
+
+    response = requests.get(
+        base_url + "efetch.fcgi",
+        params={
+            "db": "pubmed",
+            "id": ",".join(pmids),
+            "retmode": "xml",
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+
+    root = ET.fromstring(response.text)
+    papers = []
+
+    for article in root.findall(".//PubmedArticle"):
+        pmid = article.findtext(".//PMID", default="").strip()
+
+        if not pmid or pmid in existing_pmids:
+            continue
+
+        title_element = article.find(".//ArticleTitle")
+        title = (
+            "".join(title_element.itertext()).strip()
+            if title_element is not None
+            else ""
+        )
+
+        abstract_parts = [
+            "".join(part.itertext()).strip()
+            for part in article.findall(".//Abstract/AbstractText")
+        ]
+        abstract = " ".join(
+            part for part in abstract_parts if part
+        ).strip()
+
+        if not title or not abstract:
+            continue
+
+        # Extrai os sobrenomes dos autores para as citações.
+        authors = []
+        for author in article.findall(
+            ".//MedlineCitation/Article/AuthorList/Author"
+        ):
+            last_name = author.findtext("LastName", default="").strip()
+            collective_name = author.findtext(
+                "CollectiveName", default=""
+            ).strip()
+
+            name = last_name or collective_name
+            if name:
+                authors.append(name)
+
+        # Extrai o ano da publicação, com alternativa para MedlineDate.
+        year = (
+            article.findtext(
+                ".//Journal/JournalIssue/PubDate/Year"
+            )
+            or article.findtext(
+                ".//Journal/JournalIssue/PubDate/MedlineDate"
+            )
+            or ""
+        ).strip()
+
+        year_match = re.search(r"\b(?:19|20)\d{2}\b", year)
+        year = year_match.group(0) if year_match else ""
+
+        papers.append({
+            "pmid": pmid,
+            "title": title,
+            "abstract": abstract,
+            "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+            "text": f"{title}. {abstract}",
+            "authors": authors,
+            "year": year,
+        })
+
+        if len(papers) >= retmax:
+            break
+
+    if not papers:
+        return pd.DataFrame(columns=columns)
+
+    return prepare_papers(pd.DataFrame(papers))
+
+#-----------------------------------------------------------------------------------------
 
 def prepare_papers(papers):
     # Verifica se todas as colunas necessárias estão presentes.
@@ -335,9 +458,14 @@ def extract_evidence(question, context, client, model_name="openai/gpt-oss-120b"
 #-----------------------------------------------------------------------------------------
 
 def normalize_for_match(text):
-    # Padroniza caracteres Unicode e diferentes tipos de aspas e travessões.
+    # Padroniza caracteres Unicode.
     text = unicodedata.normalize("NFKC", str(text))
-    text = text.replace("–", "-").replace("—", "-")
+
+    # Padroniza diferentes tipos de hífen e espaços inseparáveis.
+    text = re.sub(r"[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]", "-", text)
+    text = text.replace("\u00A0", " ").replace("\u202F", " ")
+
+    # Padroniza aspas.
     text = text.replace("‘", "'").replace("’", "'")
     text = text.replace("“", '"').replace("”", '"')
 
@@ -394,16 +522,37 @@ def verify_extracted_quotations(evidence, papers):
         for _, row in papers.iterrows()
     }
 
+    # Associa cada título ao respectivo artigo para usar como alternativa.
+    papers_by_title = {
+        str(row["title"]).strip().casefold(): row
+        for _, row in papers.iterrows()
+    }
+
     checked_quotes = []
     current_url = None
+    current_title = None
 
     # Analisa as fontes e citações extraídas pelo modelo.
     for line in evidence.splitlines():
         line = line.strip()
 
         # Identifica o artigo ao qual as próximas citações pertencem.
-        if line.startswith(("URL:", "Source:")):
-            current_url = line.split(":", 1)[1].strip()
+        # Aceita rótulos com ou sem formatação Markdown.
+        label_match = re.match(
+            r"^\**\s*(Paper|Source|URL)\s*:\**\s*(.*?)\s*$",
+            line,
+            flags=re.IGNORECASE,
+        )
+
+        if label_match:
+            label = label_match.group(1).casefold()
+            value = label_match.group(2).strip()
+
+            if label == "paper":
+                current_title = value
+            else:
+                current_url = value
+
             continue
 
         # Processa apenas linhas de citação iniciadas por "- ".
@@ -417,7 +566,14 @@ def verify_extracted_quotations(evidence, papers):
             continue
 
         quote = match.group(1).strip()
-        paper = papers_by_url.get(normalize_url(current_url or ""))
+
+        # Primeiro tenta identificar a fonte pela URL; depois, pelo título.
+        paper = papers_by_url.get(
+            normalize_url(current_url or "")
+        )
+
+        if paper is None and current_title:
+            paper = papers_by_title.get(current_title.casefold())
 
         if paper is None:
             checked_quotes.append({
@@ -440,24 +596,67 @@ def verify_extracted_quotations(evidence, papers):
 
 #-----------------------------------------------------------------------------------------
 
+# def build_evidence_table(checked_quotes, papers):
+#     # Define as colunas da tabela de evidências.
+#     columns = [
+#         "Paper",
+#         "url",
+#         "Quotation",
+#         "Verification",
+#         "Source matched"
+#     ]
+
+#     if not checked_quotes:
+#         return pd.DataFrame(columns=columns)
+
+#     # Converte as citações verificadas em uma tabela.
+#     evidence_df = pd.DataFrame(checked_quotes)
+
+#     # Recupera os dados dos artigos usando seus títulos.
+#     paper_details = papers[["title", "url", "abstract"]].copy()
+
+#     evidence_df = evidence_df.merge(
+#         paper_details,
+#         left_on="Paper",
+#         right_on="title",
+#         how="left"
+#     )
+
+#     # Indica se a fonte foi associada a um resumo disponível.
+#     evidence_df["Source matched"] = evidence_df["abstract"].notna()
+
+#     evidence_df["Paper"] = evidence_df["title"].fillna(
+#         evidence_df["Paper"]
+#     )
+
+#     return evidence_df[columns]
 def build_evidence_table(checked_quotes, papers):
     # Define as colunas da tabela de evidências.
     columns = [
-        "Paper",
-        "url",
-        "Quotation",
-        "Verification",
-        "Source matched"
+        "Paper", "url", "Quotation", "Abstract passage",
+        "Verification", "Source matched", "authors", "year"
     ]
 
     if not checked_quotes:
         return pd.DataFrame(columns=columns)
 
-    # Converte as citações verificadas em uma tabela.
     evidence_df = pd.DataFrame(checked_quotes)
 
-    # Recupera os dados dos artigos usando seus títulos.
-    paper_details = papers[["title", "url", "abstract"]].copy()
+    # Renomeia os campos da fonte para evitar conflitos na junção.
+    paper_details = papers.copy()
+
+    for col in ["title", "url", "abstract", "authors", "year"]:
+        if col not in paper_details.columns:
+            paper_details[col] = None
+
+    paper_details = paper_details[
+        ["title", "url", "abstract", "authors", "year"]
+    ].rename(columns={
+        "url": "source_url",
+        "abstract": "source_abstract",
+        "authors": "source_authors",
+        "year": "source_year"
+    })
 
     evidence_df = evidence_df.merge(
         paper_details,
@@ -466,15 +665,22 @@ def build_evidence_table(checked_quotes, papers):
         how="left"
     )
 
-    # Indica se a fonte foi associada a um resumo disponível.
-    evidence_df["Source matched"] = evidence_df["abstract"].notna()
-
+    # Usa os metadados do artigo recuperado como referência.
     evidence_df["Paper"] = evidence_df["title"].fillna(
         evidence_df["Paper"]
     )
+    evidence_df["url"] = evidence_df.get(
+        "url", pd.Series(index=evidence_df.index, dtype=object)
+    ).fillna(evidence_df["source_url"])
+
+    evidence_df["Abstract passage"] = evidence_df["source_abstract"].fillna(
+        "Source abstract unavailable."
+    )
+    evidence_df["authors"] = evidence_df["source_authors"]
+    evidence_df["year"] = evidence_df["source_year"]
+    evidence_df["Source matched"] = evidence_df["source_abstract"].notna()
 
     return evidence_df[columns]
-
 #-----------------------------------------------------------------------------------------
 
 
@@ -534,13 +740,11 @@ def generate_final_answer(
     Rules:
     - Answer the question directly and clearly.
     - Support factual claims with evidence from the supplied sources.
-    - Cite sources only as clickable Markdown links in this format:
-    [Exact paper title](URL)
-    - Use only URLs supplied in the retrieved papers.
-    - Never wrap citations in 【 】 or append a separate URL after a citation.
-    - Use only URLs supplied in the source material. Never invent URLs.
+    - Cite supporting papers using this exact format: [PMID: 12345678].
+    - Use only PMIDs present in the retrieved papers.
     - Place citations immediately after the claims they support.
-    - Cite only papers that actually support the associated claim.
+    - Do not invent author names, publication years, or citations.
+    - Do not output Markdown links for citations.
     - Do not present quotations marked "Not found" as verified.
     - Do not treat a quotation's presence in an abstract as proof
       of a broader interpretation that the abstract does not support.
@@ -585,4 +789,127 @@ def generate_final_answer(
     # return response.choices[0].message.content
     # Converte as referências internas em links para os artigos.
     answer = response.choices[0].message.content
-    return link_paper_citations(answer, retrieved_papers)
+    return answer
+
+
+
+def format_citation(paper, fallback_number):
+    """Cria uma citação autor-data ou usa um número como alternativa."""
+
+    authors = paper.get("authors", [])
+    year = str(paper.get("year", "")).strip()
+
+    if isinstance(authors, str):
+        authors = [name.strip() for name in authors.split(";") if name.strip()]
+
+    if authors and year:
+        if len(authors) == 1:
+            author_label = authors[0]
+        elif len(authors) == 2:
+            author_label = f"{authors[0]} & {authors[1]}"
+        else:
+            author_label = f"{authors[0]} et al."
+
+        return f"({author_label}, {year})"
+
+    return f"[{fallback_number}]"
+
+#-----------------------------------------------------------------------------------------
+
+def build_references(retrieved_papers):
+    """Monta as referências com metadados e links dos artigos recuperados."""
+
+    references = []
+
+    for index, (_, paper) in enumerate(
+        retrieved_papers.iterrows(), start=1
+    ):
+        citation = format_citation(paper, index)
+
+        references.append({
+            "Citation": citation,
+            "Title": paper["title"],
+            "Authors": paper.get("authors", []),
+            "Year": paper.get("year", ""),
+            "PMID": str(paper["pmid"]),
+            "URL": paper["url"],
+        })
+
+    return pd.DataFrame(references)
+
+#-----------------------------------------------------------------------------------------
+
+def replace_pmid_citations(answer, retrieved_papers):
+    """Substitui marcadores PMID por citações autor-data."""
+
+    papers_by_pmid = {}
+
+    for index, (_, paper) in enumerate(
+        retrieved_papers.iterrows(), start=1
+    ):
+        pmid = str(paper.get("pmid", "")).strip()
+        if not pmid:
+            continue
+
+        authors = paper.get("authors", [])
+        year = str(paper.get("year", "")).strip()
+
+        if isinstance(authors, str):
+            authors = [
+                name.strip()
+                for name in authors.split(";")
+                if name.strip()
+            ]
+
+        if authors and year:
+            if len(authors) == 1:
+                citation = f"({authors[0]}, {year})"
+            elif len(authors) == 2:
+                citation = f"({authors[0]} & {authors[1]}, {year})"
+            else:
+                citation = f"({authors[0]} et al., {year})"
+        else:
+            citation = f"[{index}]"
+
+        papers_by_pmid[pmid] = citation
+
+    def replace_match(match):
+        pmid = match.group(1)
+        return papers_by_pmid.get(pmid, match.group(0))
+
+    return re.sub(
+        r"[\[【]PMID:\s*(\d+)[\]】]",
+        replace_match,
+        answer,
+        flags=re.IGNORECASE,
+    )
+
+#-----------------------------------------------------------------------------------------
+
+def get_author_year_citation(paper):
+    """Retorna uma citação autor-data para um artigo."""
+
+    authors = paper.get("authors", [])
+    year = paper.get("year", "")
+
+    if isinstance(authors, str):
+        authors = [
+            author.strip()
+            for author in authors.split(";")
+            if author.strip()
+        ]
+
+    if not isinstance(authors, (list, tuple)) or not authors:
+        return ""
+
+    if pd.isna(year) or not str(year).strip():
+        return ""
+
+    if len(authors) == 1:
+        author_text = authors[0]
+    elif len(authors) == 2:
+        author_text = f"{authors[0]} & {authors[1]}"
+    else:
+        author_text = f"{authors[0]} et al."
+
+    return f"{author_text}, {year}"

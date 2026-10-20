@@ -6,6 +6,7 @@ from groq import Groq
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
 from functions import (
+    search_pubmed,
     prepare_papers,
     prepare_embeddings,
     rank_by_embedding,
@@ -16,12 +17,15 @@ from functions import (
     verify_extracted_quotations,
     build_evidence_table,
     generate_final_answer,
+    build_references,
+    replace_pmid_citations,
+    get_author_year_citation,
 )
 
 
 # Configurações gerais do aplicativo
 st.set_page_config(
-    page_title="Bioinformatics AI Research Assistant",
+    page_title="Scientific Literature Research Assistant",
     page_icon="🧬",
     layout="wide"
 )
@@ -78,11 +82,11 @@ def load_paper_embeddings(_papers, _embedding_model):
 #-----------------------------------------------------------------------------------------
 
 
+
 # Apresentação do aplicativo
-st.title("🧬 Bioinformatics AI Research Assistant")
+st.title("🧬 Scientific Literature Research Assistant")
 st.write(
-    "Ask questions about artificial intelligence, machine learning, "
-    "bioinformatics, and drug discovery using scientific papers from PubMed."
+    "Search PubMed for biomedical and life-science literature. "
 )
 
 # Obtém a chave da API sem exibi-la na tela.
@@ -98,175 +102,362 @@ if not api_key:
 # Inicializa o cliente da API.
 client = Groq(api_key=api_key)
 
-# Campo para a pergunta do usuário.
-question = st.text_input(
-    "Your research question",
-    placeholder="How is machine learning used to identify drug candidates?"
-)
+# Carrega os artigos da coleção curada.
+try:
+    papers_curated = load_papers()
+except Exception as e:
+    st.error("Não foi possível carregar a coleção curada de artigos.")
+    st.exception(e)
+    st.stop()
 
-# Botão para iniciar a busca e gerar a resposta.
-run_search = st.button(
-    "Search papers and generate answer",
-    type="primary",
-    disabled=not question.strip()
+# Cria as duas áreas de pesquisa.
+tab_curated, tab_pubmed = st.tabs(
+    ["📚 ML & Bioinformatics Preselected Papers", "🔎 Search PubMed (for broader biomedical and life-science searches)"]
 )
 
 
 #-----------------------------------------------------------------------------------------
+# Função compartilhada pelas duas áreas de pesquisa
+#-----------------------------------------------------------------------------------------
 
 
-if run_search:
-    try:
-        with st.spinner("Loading papers and AI models..."):
-            papers = load_papers()
-            embedding_model = load_embedding_model()
-            reranker = load_reranker()
+def run_research(question, papers, usar_cache=False):
+    """Executa a recuperação de artigos, a extração de evidências e a resposta."""
+
+    if papers.empty:
+        st.warning("Nenhum artigo disponível para responder à pergunta.")
+        return
+
+    with st.spinner("Loading AI models..."):
+        embedding_model = load_embedding_model()
+        reranker = load_reranker()
+
+        # Reutiliza os embeddings em cache para a coleção curada.
+        if usar_cache:
             paper_embeddings = load_paper_embeddings(
                 papers, embedding_model
             )
-
-        st.success(f"Loaded {len(papers)} scientific papers.")
-
-        with st.spinner("Finding relevant papers..."):
-            # Classifica os artigos pela similaridade semântica.
-            embedding_results = rank_by_embedding(
-                query=question,
+        else:
+            # Os embeddings da busca no PubMed são gerados temporariamente.
+            paper_embeddings = prepare_embeddings(
                 papers=papers,
-                paper_embeddings=paper_embeddings,
                 embedding_model=embedding_model
             )
 
-            # Reavalia os artigos com o cross-encoder.
-            cross_encoder_results = rank_by_cross_encoder(
-                query=question,
-                papers=papers,
-                cross_encoder=reranker
-            )
+    with st.spinner("Finding relevant papers..."):
+        # Classifica os artigos pela similaridade semântica.
+        embedding_results = rank_by_embedding(
+            query=question,
+            papers=papers,
+            paper_embeddings=paper_embeddings,
+            embedding_model=embedding_model
+        )
 
-            # Combina os dois rankings usando Reciprocal Rank Fusion.
-            hybrid_results = hybrid_retrieve(
-                embedding_results=embedding_results,
-                cross_encoder_results=cross_encoder_results,
-                top_k=min(TOP_K, len(papers)),
-                rrf_k=RRF_K
-            )
+        # Reavalia os artigos com o cross-encoder.
+        cross_encoder_results = rank_by_cross_encoder(
+            query=question,
+            papers=papers,
+            cross_encoder=reranker
+        )
 
-            retrieval_context = build_retrieval_context(hybrid_results)
+        # Combina os dois rankings usando Reciprocal Rank Fusion.
+        hybrid_results = hybrid_retrieve(
+            embedding_results=embedding_results,
+            cross_encoder_results=cross_encoder_results,
+            top_k=min(TOP_K, len(papers)),
+            rrf_k=RRF_K
+        )
 
-        #-----------------------------------------------------------------------------------------
+        retrieval_context = build_retrieval_context(hybrid_results)
 
-        with st.spinner("Extracting evidence from the papers..."):
-            evidence = extract_evidence(
-                question=question,
-                context=retrieval_context,
-                client=client,
-                model_name=MODEL_NAME
-            )
+    with st.spinner("Extracting evidence from the papers..."):
+        evidence = extract_evidence(
+            question=question,
+            context=retrieval_context,
+            client=client,
+            model_name=MODEL_NAME
+        )
 
-            checked_quotes = verify_extracted_quotations(
-                evidence=evidence,
-                papers=papers
-            )
-
-        evidence_table = build_evidence_table(
-            checked_quotes=checked_quotes,
+        checked_quotes = verify_extracted_quotations(
+            evidence=evidence,
             papers=papers
         )
 
-        #-----------------------------------------------------------------------------------------
-
-        st.subheader("Final answer")
-
-        st.warning(
-            "The text below is an AI-generated response based on retrieved scientific papers. "
-            "It may contain inaccuracies or unsupported interpretations. "
-            "Check the original publications before relying on its claims."
-        )
-
-        
-        with st.spinner("Generating the final answer..."):
-            final_answer = generate_final_answer(
-                query=question,
-                retrieved_papers=hybrid_results,
-                evidence=evidence,
-                checked_quotes=checked_quotes,
-                client=client,
-                model_name=MODEL_NAME
-            )
-
-        st.markdown(final_answer)
-
-        #-----------------------------------------------------------------------------------------
-
-        with st.expander("Evidence and quotation verification"):
-                    st.markdown("**Extracted evidence**")
-                    st.markdown(evidence)
-                    st.markdown("---")
-                    st.markdown("**Quotation verification results**")
-                    for _, row in evidence_table.iterrows():
-                        st.markdown(f"**Quotation:** {row['Quotation']}")
-                        st.markdown(f"**Paper:** {row['Paper']}")
-                        st.markdown(
-                            f"**Verification:** {row['Verification']}  \n"
-                            f"**Source matched:** {row['Source matched']}"
-                        )
-                        st.markdown(f"[Open source paper]({row['url']})")
-                        st.divider()
-
-        #-----------------------------------------------------------------------------------------
-
-        with st.expander("Retrieved papers and relevance scores"):
-
-                    # 1. Filtre as colunas e arredonde os valores
-                    df_to_show = hybrid_results[
-                        [
-                            "hybrid_rank",
-                            "title",
-                            "embedding_score",
-                            "embedding_rank",
-                            "cross_score",
-                            "cross_rank",
-                            "rrf_score"
-                        ]
-                    ].round(4)
-
-                    # 2. Renomeie as colunas (substituindo o "column_config")
-                    df_to_show = df_to_show.rename(columns={
-                        "hybrid_rank": "Final rank",
-                        "title": "Paper",
-                        "embedding_score": "Embedding score",
-                        "embedding_rank": "Embedding rank",
-                        "cross_score": "Cross-encoder score",
-                        "cross_rank": "Cross-encoder rank",
-                        "rrf_score": "RRF score"
-                    })
-
-                    # 3. Formate os números flutuantes para exibir 4 casas decimais (igual ao format="%.4f")
-                    # Isso garante que zeros à direita não sumam na tabela estática
-                    float_cols = ["Embedding score", "Cross-encoder score", "RRF score"]
-                    df_to_show[float_cols] = df_to_show[float_cols].map(lambda x: f"{x:.4f}")
-
-                    # 4. Use st.table. Para esconder o índice, envie apenas os valores (.values) 
-                    # e defina as colunas manualmente
-                    st.table(df_to_show.set_index("Final rank")) 
-                    # Dica: Usar o "Final rank" como índice economiza espaço e remove a coluna padrão do Pandas!
-
-
-                    st.markdown("**Final rank:** combined position.")                        
-                    st.markdown("**Paper:** article title.")
-                    st.markdown("**Embedding score/rank:** semantic similarity and its position.")
-                    st.markdown("**Cross-encoder score/rank:** relevance score and its position.")
-                    st.markdown("**RRF score:** combined ranking score; higher values indicate a higher rank.")
-
-        #-----------------------------------------------------------------------------------------
-
-    # except Exception as error:
-    #     st.error(f"An error occurred during retrieval: {error}")
-
-    except Exception as e:
-        st.error("An error occurred during retrieval:")
-        st.exception(e)
-
+    evidence_table = build_evidence_table(
+        checked_quotes=checked_quotes,
+        papers=papers
+    )
 
 #-----------------------------------------------------------------------------------------
 
+    st.subheader("Final answer")
+
+    st.warning(
+        "The text below is an AI-generated response based on retrieved scientific "
+        "papers. It may contain inaccuracies or unsupported interpretations. "
+        "Check the original publications before relying on its claims."
+    )
+
+    with st.spinner("Generating the final answer..."):
+        final_answer = generate_final_answer(
+            query=question,
+            retrieved_papers=hybrid_results,
+            evidence=evidence,
+            checked_quotes=checked_quotes,
+            client=client,
+            model_name=MODEL_NAME
+        )
+
+
+    answer_display = final_answer.replace("【PMID:", "[PMID:")
+    answer_display = answer_display.replace("】", "]")
+    answer_display = replace_pmid_citations(
+        answer_display,
+        hybrid_results
+    )
+
+    st.markdown(answer_display)
+
+#-----------------------------------------------------------------------------------------
+
+    # Exibe cada evidência junto com sua verificação.
+    papers_by_pmid = {
+        str(row.get("pmid", "")).strip(): row
+        for _, row in hybrid_results.iterrows()
+    }
+
+    with st.expander("Evidence and quotation verification"):
+        
+        if evidence_table.empty:
+            st.info(
+                "No relevant evidence was extracted from the retrieved papers. "
+                "This does not necessarily mean that no research exists on the topic. "
+                "The relevant studies may not have been retrieved, or their abstracts "
+                "may not contain sufficient information to answer the question. "
+                "Try refining your search or using more specific keywords."
+            )
+        else:
+
+            for _, row in evidence_table.iterrows():
+                paper = {
+                    "authors": row.get("authors", []),
+                    "year": row.get("year", "")
+                }
+                citation = get_author_year_citation(paper)
+
+                title = row["Paper"]
+                heading = f"{title} ({citation})" if citation else title
+
+                with st.container(border=True):
+                    st.markdown(f"**Paper:** {heading}")
+
+                    st.markdown("**Quotation selected by the LLM**")
+                    st.markdown(f"> {row['Quotation']}")
+
+                    st.markdown("**Abstract used for verification**")
+                    st.markdown(f'> {row["Abstract passage"]}')
+
+                    st.markdown(
+                        f"**Verification:** {row['Verification']}  \n"
+                        f"**Source matched:** {row['Source matched']}"
+                    )
+                    st.markdown(f"[Open source paper]({row['url']})")
+
+#-----------------------------------------------------------------------------------------
+    # # # Funcionalidade desativada, pois essas informações 
+    # # # já são mostradas no expander anterior
+
+    # # Mostra as referências
+    # with st.expander("📚 References"):
+    #     references = build_references(hybrid_results)
+
+    #     for _, reference in references.iterrows():
+    #         st.markdown(
+    #             f"**{reference['Citation']}** — "
+    #             f"[{reference['Title']}]({reference['URL']})"
+    #         )
+
+    #         authors = reference["Authors"]
+    #         if isinstance(authors, list) and authors:
+    #             st.caption("Authors: " + ", ".join(authors))
+
+    #         if reference["Year"]:
+    #             st.caption(f"Publication year: {reference['Year']}")
+
+    #         st.caption(f"PMID: {reference['PMID']}")
+
+#-----------------------------------------------------------------------------------------
+
+    # Exibe os artigos recuperados e suas pontuações de relevância.
+    with st.expander("Retrieved papers and relevance scores"):
+        colunas = [
+            "hybrid_rank",
+            "title",
+            "embedding_score",
+            "embedding_rank",
+            "cross_score",
+            "cross_rank",
+            "rrf_score"
+        ]
+
+        df_to_show = hybrid_results[colunas].round(4).rename(columns={
+            "hybrid_rank": "Final rank",
+            "title": "Paper",
+            "embedding_score": "Embedding score",
+            "embedding_rank": "Embedding rank",
+            "cross_score": "Cross-encoder score",
+            "cross_rank": "Cross-encoder rank",
+            "rrf_score": "RRF score"
+        })
+
+        # Formata as pontuações com quatro casas decimais.
+        float_cols = [
+            "Embedding score",
+            "Cross-encoder score",
+            "RRF score"
+        ]
+        df_to_show[float_cols] = df_to_show[float_cols].map(
+            lambda x: f"{x:.4f}"
+        )
+
+        st.table(df_to_show.set_index("Final rank"))
+
+        st.markdown("**How to interpret these results**")
+        st.markdown(
+            """
+            - **Final rank:** the paper's position after combining both ranking methods.
+            - **Paper:** the title of the article.
+            - **Embedding score/rank:** measures how closely the paper's meaning matches your question. Higher scores indicate greater semantic similarity.
+            - **Cross-encoder score/rank:** a second model evaluates the question and paper together to estimate their relevance. Higher scores generally indicate greater relevance.
+            - **RRF score (Reciprocal Rank Fusion):** combines the positions assigned by both methods. Papers ranked highly by both tend to receive higher RRF scores.
+            """
+        )
+
+
+#-----------------------------------------------------------------------------------------
+# Aba 1: coleção curada de artigos
+#-----------------------------------------------------------------------------------------
+
+
+with tab_curated:
+    st.subheader("Curated Collection")
+    st.write(
+        f"Search your research question across the {len(papers_curated)} "
+        "articles in the curated collection."
+    )
+
+    with st.form("form_curated"):
+        question_curated = st.text_input(
+            "Your research question",
+            placeholder="How is machine learning used to identify drug candidates?"
+        )
+        submit_curated = st.form_submit_button(
+            "Search curated papers and generate answer",
+            type="primary"
+        )
+
+    if submit_curated:
+        if not question_curated.strip():
+            st.warning("Enter a research question.")
+        else:
+            try:
+                st.success(
+                    f"Using {len(papers_curated)} papers from the curated collection."
+                )
+
+                # Mostra os artigos encontrados antes de gerar a resposta.
+                with st.expander("Articles in the curated collection", expanded=False):
+                    for _, paper in papers_curated.iterrows():
+                        citation = get_author_year_citation(paper)
+                        label = f"[{paper['title']}]({paper['url']})"
+                        if citation:
+                            label += f" ({citation})"
+                        st.markdown(f"- {label}")
+                        
+                run_research(
+                    question=question_curated.strip(),
+                    papers=papers_curated,
+                    usar_cache=True
+                )
+            except Exception as e:
+                st.error("An error occurred during retrieval:")
+                st.exception(e)
+
+
+#-----------------------------------------------------------------------------------------
+# Aba 2: busca de novos artigos no PubMed
+#-----------------------------------------------------------------------------------------
+
+
+with tab_pubmed:
+    st.subheader("Search PubMed")
+    st.write(
+        "Search PubMed using your own query. The app retrieves up to 50 "
+        "articles with abstracts. Search results are temporary and do not "
+        "modify the preselected papers."
+    )
+
+    with st.form("form_pubmed"):
+        pubmed_query = st.text_input(
+            "PubMed search query",
+            placeholder='("machine learning" AND bioinformatics) OR "drug discovery"'
+        )
+
+        question_pubmed = st.text_input(
+            "Your research question",
+            placeholder="What methods and findings are reported in these studies?"
+        )
+
+        submit_pubmed = st.form_submit_button(
+            "Search PubMed and generate answer",
+            type="primary"
+        )
+
+    if submit_pubmed:
+        if not pubmed_query.strip():
+            st.warning("Enter a PubMed search query.")
+        elif not question_pubmed.strip():
+            st.warning("Enter a separate research question.")
+        else:
+            try:
+                with st.spinner("Searching PubMed for new articles..."):
+                    # Recupera artigos sem alterar a coleção salva.
+                    existing_pmids = papers_curated["pmid"].astype(str).tolist()
+                    papers_pubmed = search_pubmed(
+                        query=pubmed_query.strip(),
+                        existing_pmids=existing_pmids,
+                        retmax=50
+                    )
+
+                if papers_pubmed.empty:
+                    st.warning(
+                        "No new articles with abstracts were found. Try another "
+                        "query or broaden your search."
+                    )
+                else:
+                    st.success(
+                        f"Retrieved {len(papers_pubmed)} new articles with abstracts."
+                    )
+
+                    # Mostra os artigos encontrados antes de gerar a resposta.
+                    with st.expander("Articles retrieved from PubMed", expanded=False):
+                        for _, paper in papers_pubmed.iterrows():
+                            citation = get_author_year_citation(paper)
+                            title = paper["title"]
+                            url = paper["url"]
+
+                            label = f"[{title}]({url})"
+                            if citation:
+                                label += f" ({citation})"
+
+                            st.markdown(f"- {label}")
+
+                    run_research(
+                        question=question_pubmed.strip(),
+                        papers=papers_pubmed,
+                        usar_cache=False
+                    )
+
+            except Exception as e:
+                st.error("An error occurred during the PubMed search or retrieval:")
+                st.exception(e)
