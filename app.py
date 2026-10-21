@@ -2,7 +2,7 @@ import os
 
 import pandas as pd
 import streamlit as st
-from groq import Groq
+from groq import Groq, RateLimitError
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
 from functions import (
@@ -36,6 +36,10 @@ RERANKER_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 TOP_K = 5
 RRF_K = 60
 PAPERS_PATH = "pubmed_papers.csv"
+
+MAX_AI_QUERIES = 5
+if "ai_queries" not in st.session_state:
+    st.session_state.ai_queries = 0
 
 
 #-----------------------------------------------------------------------------------------
@@ -359,7 +363,10 @@ with tab_curated:
     if submit_curated:
         if not question_curated.strip():
             st.warning("Enter a research question.")
+        elif st.session_state.ai_queries >= MAX_AI_QUERIES:
+            st.warning("Session limit reached. Please try again later.")
         else:
+            st.session_state.ai_queries += 1
             try:
                 st.success(
                     f"Using {len(papers_curated)} papers from the curated collection."
@@ -379,8 +386,11 @@ with tab_curated:
                     papers=papers_curated,
                     usar_cache=True
                 )
+
+            except RateLimitError:
+                st.error("The AI service has reached its usage limit. Please try again later.")
             except Exception as e:
-                st.error("An error occurred during retrieval:")
+                st.error(f"An error occurred: {e}")
                 st.exception(e)
 
 
@@ -418,6 +428,8 @@ with tab_pubmed:
             st.warning("Enter a PubMed search query.")
         elif not question_pubmed.strip():
             st.warning("Enter a separate research question.")
+        elif st.session_state.ai_queries >= MAX_AI_QUERIES:
+            st.warning("Session limit reached. Please try again later.")
         else:
             try:
                 with st.spinner("Searching PubMed for new articles..."):
@@ -435,6 +447,7 @@ with tab_pubmed:
                         "query or broaden your search."
                     )
                 else:
+                    st.session_state.ai_queries += 1
                     st.success(
                         f"Retrieved {len(papers_pubmed)} new articles with abstracts."
                     )
@@ -458,6 +471,8 @@ with tab_pubmed:
                         usar_cache=False
                     )
 
+            except RateLimitError:
+                st.error("The AI service has reached its usage limit. Please try again later.")
             except Exception as e:
-                st.error("An error occurred during the PubMed search or retrieval:")
+                st.error(f"An error occurred: {e}")
                 st.exception(e)
